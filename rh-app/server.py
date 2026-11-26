@@ -23,6 +23,12 @@ def build_db():
     con.executescript(open(os.path.join(ROOT, "db/inserts_new.sql"), encoding="utf-8").read())
     con.commit(); con.close()
 
+def apply_triggers():
+    """Cria/recria as triggers de db/triggers.sql (idempotente, roda a cada start)."""
+    con = sqlite3.connect(DB)
+    con.executescript(open(os.path.join(ROOT, "db/triggers.sql"), encoding="utf-8").read())
+    con.commit(); con.close()
+
 def connect():
     con = sqlite3.connect(DB)
     con.row_factory = sqlite3.Row
@@ -133,6 +139,7 @@ class H(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     if "--reset" in sys.argv and os.path.exists(DB): os.remove(DB)
     if not os.path.exists(DB): build_db(); print("Banco criado a partir de db/*.sql")
+    apply_triggers(); print("Triggers aplicadas (db/triggers.sql)")
     port = int(os.environ.get("PORT", 8000))
     print(f"RH rodando em http://localhost:{port}")
     ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()
