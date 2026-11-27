@@ -614,6 +614,214 @@
         const tbl = (cols, rows, cb) => rows.length ? `<div class="wrap"><table><thead><tr>${cols.map(c => `<th>${c[0]}</th>`).join('')}</tr></thead><tbody>${rows.map((r, i) => `<tr class="${cb ? 'clk' : ''}" ${cb ? `data-i="${i}"` : ''}>${cols.map(c => `<td>${c[1](r)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>` : '<div class="mut">Nenhum registro encontrado.</div>';
         const row = (l, v, s) => `<div class="row"><label>${l}:</label><div class="f ${s ? 's' : ''}">${esc(v)}</div></div>`;
         const f = () => F[cur], cg = x => I.cargo[x.id_cargo];
+
+        async function atualizarFuncionario(id, dados) {
+
+            const resposta = await fetch(
+                `/api/table/funcionarios?id=${encodeURIComponent(id)}`,
+                {
+                    method: 'PUT',
+
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+
+                    body: JSON.stringify(dados)
+                }
+            );
+
+            const resultado = await resposta.json();
+
+            if (!resposta.ok) {
+                throw new Error(
+                    resultado.error || 'Erro ao atualizar funcionário.'
+                );
+            }
+
+            return resultado;
+        }
+
+        function editarFuncionario(x) {
+
+            document.getElementById('form').innerHTML = `
+
+        <div id="body">
+
+            <h3>Editar funcionário</h3>
+
+            <div class="row">
+                <label>Código:</label>
+                <input
+                    id="ed_id"
+                    class="f"
+                    value="${x.id_funcionario}"
+                    readonly
+                >
+            </div>
+
+            <div class="row">
+                <label>Nome:</label>
+                <input
+                    id="ed_nome"
+                    class="f"
+                    value="${esc(x.nome_funcionario)}"
+                >
+            </div>
+
+            <div class="row">
+                <label>E-mail:</label>
+                <input
+                    id="ed_email"
+                    class="f"
+                    value="${esc(x.email_funcionario)}"
+                >
+            </div>
+
+            <div class="row">
+                <label>Telefone:</label>
+                <input
+                    id="ed_telefone"
+                    class="f"
+                    value="${esc(x.telefone_funcionario)}"
+                >
+            </div>
+
+            <div class="row">
+                <label>CPF:</label>
+                <input
+                    id="ed_cpf"
+                    class="f"
+                    value="${esc(x.cpf_funcionario)}"
+                >
+            </div>
+
+            <div class="row">
+                <label>Status:</label>
+
+                <select id="ed_status" class="f">
+
+                    <option value="1"
+                        ${x.status_funcionario ? 'selected' : ''}>
+                        Ativo
+                    </option>
+
+                    <option value="0"
+                        ${!x.status_funcionario ? 'selected' : ''}>
+                        Inativo
+                    </option>
+
+                </select>
+            </div>
+
+            <div class="row">
+                <label>Cargo:</label>
+
+                <select id="ed_cargo" class="f">
+
+                    ${D.cargos.map(c => `
+                        <option
+                            value="${c.id_cargo}"
+                            ${c.id_cargo == x.id_cargo ? 'selected' : ''}>
+                            ${esc(c.nome_cargo)}
+                        </option>
+                    `).join('')}
+
+                </select>
+            </div>
+
+            <div class="row">
+                <label>Departamento:</label>
+
+                <div class="f s">
+                    ${esc(I.dep[x.id_cargo ?
+                I.cargo[x.id_cargo].id_departamento :
+                ''].nome_departamento || '')}
+                </div>
+            </div>
+
+            <br>
+
+            <button id="btnSalvar" class="hl">
+                Salvar alterações
+            </button>
+
+            <button id="btnCancelar">
+                Cancelar
+            </button>
+
+            <div id="msgEdicao"></div>
+
+        </div>
+    `;
+
+            document.getElementById('btnCancelar').onclick = () => {
+                emp();
+            };
+
+            document.getElementById('btnSalvar').onclick = async () => {
+
+                const msg = document.getElementById('msgEdicao');
+
+                try {
+
+                    msg.textContent = 'Salvando...';
+
+                    const dados = {
+
+                        nome_funcionario:
+                            document.getElementById('ed_nome').value,
+
+                        email_funcionario:
+                            document.getElementById('ed_email').value,
+
+                        telefone_funcionario:
+                            document.getElementById('ed_telefone').value,
+
+                        cpf_funcionario:
+                            document.getElementById('ed_cpf').value,
+
+                        status_funcionario:
+                            Number(document.getElementById('ed_status').value),
+
+                        id_cargo:
+                            Number(document.getElementById('ed_cargo').value)
+                    };
+
+                    await atualizarFuncionario(
+                        x.id_funcionario,
+                        dados
+                    );
+
+                    msg.textContent =
+                        'Alteração salva no MySQL com sucesso.';
+
+                    /*
+                     * Recarrega os dados do banco para a aplicação
+                     * mostrar exatamente o que está no MySQL.
+                     */
+                    await carregarDadosDoMySQL();
+
+                    cur = F.findIndex(
+                        f => f.id_funcionario == x.id_funcionario
+                    );
+
+                    if (cur < 0) {
+                        cur = 0;
+                    }
+
+                    tab = 'Básica';
+
+                    emp();
+
+                } catch (erro) {
+
+                    console.error(erro);
+
+                    msg.textContent =
+                        'Erro: ' + erro.message;
+                }
+            };
+        }
         const TABS = {
             'Básica'(x) {
                 const e = I.end[x.id_endereco], c = cg(x), ct = D.contratos.filter(k => k.id_funcionario == x.id_funcionario).pop();
@@ -638,13 +846,23 @@
             const x = f(); document.getElementById('form').innerHTML =
                 `<div id="nav"><label>Colaborador:</label><input class="id" id="gid" value="${x.id_funcionario}"><input class="nm" readonly value="${esc(x.nome_funcionario)}"><select id="sel" class="f"><option value="">Buscar colaborador…</option>${F.map((y, i) => `<option value="${i}">${y.id_funcionario} – ${esc(y.nome_funcionario)}</option>`).join('')}</select></div>
 <div class="tabs">${Object.keys(TABS).map(t => `<button class="${t == tab ? 'on' : ''}" data-t="${t}">${t}</button>`).join('')}</div>
-<div id="body">${TABS[tab](x)}</div>
+<div id="body">${TABS[tab](x)}</div> <div class="bb">
+    <button id="btnEditar" class="hl">
+        Editar funcionário
+    </button>
+</div>
 <div class="bb"><button data-t="Dependentes" class="hl">1-Dependentes</button><button data-t="Salários">2-Salários</button><button data-t="Contratos">3-Contratos</button><button data-t="Férias">4-Férias</button><button data-t="Benefícios">5-Benefícios</button><button id="bl">6-Lista</button></div>`;
             const g = id => document.getElementById(id);
             g('gid').onchange = e => { const i = F.findIndex(y => y.id_funcionario == e.target.value); if (i >= 0) { cur = i } emp() };
             g('sel').onchange = e => { if (e.target.value !== '') { cur = +e.target.value; emp() } };
             g('bl').onclick = () => show('lista');
-            document.querySelectorAll('[data-t]').forEach(b => b.onclick = () => { tab = b.dataset.t; emp() })
+            g('btnEditar').onclick = () => editarFuncionario(x);
+
+            document.querySelectorAll('[data-t]')
+                .forEach(b => b.onclick = () => {
+                    tab = b.dataset.t;
+                    emp();
+                });
         }
         function lista() {
             document.getElementById('form').innerHTML = `<div id="nav"><input class="nm" id="q" placeholder="Pesquisar por nome, CPF, cargo ou departamento…"></div><div id="body"></div>`;

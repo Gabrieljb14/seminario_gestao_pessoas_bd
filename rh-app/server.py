@@ -590,13 +590,27 @@ class H(BaseHTTPRequestHandler):
 
             pk = None
 
+            pk_columns = table_schema["pk"]
+
+            # O frontend pode enviar a chave primária de duas formas:
+            #
+            # ?pk={"id_funcionario":1}
+            #
+            # ou, para tabelas com uma única chave primária:
+            #
+            # ?id=1
+
             if "pk" in qs:
 
                 pk = json.loads(
                     qs["pk"][0]
                 )
 
-            pk_columns = table_schema["pk"]
+            elif "id" in qs and len(pk_columns) == 1:
+
+                pk = {
+                    pk_columns[0]: qs["id"][0]
+                }
 
             where = " AND ".join(
                 f"{column}=%s"
