@@ -1,145 +1,1028 @@
 #!/usr/bin/env python3
-"""Aplicação web de RH — servidor sem dependências externas (Python 3.8+).
-Converte os scripts MySQL em db/ para SQLite na primeira execução e expõe
-uma API CRUD genérica (baseada no schema) + as consultas de db/consultas.sql."""
-import json, os, re, sqlite3, sys
-from datetime import date
+"""Aplicação web de RH conectada ao MySQL."""
+
+import json
+import os
+import re
+import sys
+import mysql.connector
+
+from datetime import date, datetime
+from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
+
+# ============================================================
+# CONFIGURAÇÃO
+# ============================================================
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
-DB = os.path.join(ROOT, "rh.db")
-LABELS = {  # expressão que identifica um registro quando ele é referenciado (a = alias)
-    "enderecos": "{a}.logradouro_endereco||', '||{a}.numero_endereco||' - '||{a}.bairro_endereco",
-    "contratos": "'Contrato #'||{a}.id_contrato||' · '||(SELECT nome_funcionario FROM funcionarios x WHERE x.id_funcionario={a}.id_funcionario)",
+
+DB_CONFIG = {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "user": "aluno",
+    "password": "aluno",
+    "database": "seminario_bsi4"
 }
 
-def build_db():
-    con = sqlite3.connect(DB)
-    ddl = open(os.path.join(ROOT, "db/create_tables.sql"), encoding="utf-8").read()
-    ddl = ddl.replace("INT NOT NULL AUTO_INCREMENT PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
-    ddl = ddl.replace("DECIMAL(10,2)", "REAL")  # evita divisão inteira do SQLite nas consultas
-    con.executescript(ddl)
-    con.executescript(open(os.path.join(ROOT, "db/inserts_new.sql"), encoding="utf-8").read())
-    con.commit(); con.close()
 
-def apply_triggers():
-    """Cria/recria as triggers de db/triggers.sql (idempotente, roda a cada start)."""
-    con = sqlite3.connect(DB)
-    con.executescript(open(os.path.join(ROOT, "db/triggers.sql"), encoding="utf-8").read())
-    con.commit(); con.close()
+# ============================================================
+# LABELS
+# ============================================================
+
+LABELS = {
+    "enderecos": (
+        "CONCAT({a}.logradouro_endereco, ', ', "
+        "{a}.numero_endereco, ' - ', {a}.bairro_endereco)"
+    ),
+
+    "contratos": (
+        "CONCAT('Contrato #', {a}.id_contrato, ' · ', "
+        "(SELECT nome_funcionario "
+        " FROM funcionarios x "
+        " WHERE x.id_funcionario = {a}.id_funcionario))"
+    ),
+}
+
+
+# ============================================================
+# CONEXÃO COM MYSQL
+# ============================================================
 
 def connect():
-    con = sqlite3.connect(DB)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA foreign_keys=ON")
-    one = lambda sql, *a: (con.execute(sql, a).fetchone() or [None])[0]
-    def anos(i):
-        d = one("SELECT MIN(data_admissao_contrato) FROM contratos WHERE id_funcionario=?", i)
-        if not d: return 0
-        a, t = date.fromisoformat(d), date.today()
-        return t.year - a.year - ((t.month, t.day) < (a.month, a.day))
-    f = con.create_function
-    f("fn_salario_atual", 1, lambda i: one("SELECT valor_salario FROM salarios WHERE id_funcionario=? AND data_fim_salario IS NULL ORDER BY data_inicio_salario DESC LIMIT 1", i) or 0)
-    f("fn_tempo_empresa", 1, anos)
-    f("fn_qtd_dependentes", 1, lambda i: one("SELECT COUNT(*) FROM funcionario_dependente WHERE id_funcionario=?", i))
-    f("fn_media_salarial_departamento", 1, lambda i: round(one("SELECT AVG(s.valor_salario) FROM cargos c JOIN funcionarios f ON f.id_cargo=c.id_cargo JOIN salarios s ON s.id_funcionario=f.id_funcionario WHERE c.id_departamento=? AND s.data_fim_salario IS NULL", i) or 0, 2))
-    return con
+    return mysql.connector.connect(**DB_CONFIG)
+
+
+# ============================================================
+# CONVERSÃO PARA JSON
+# ============================================================
+
+def json_safe(value):
+    """
+    Converte tipos retornados pelo MySQL para tipos aceitos pelo JSON.
+    """
+
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+
+    if isinstance(value, Decimal):
+        return float(value)
+
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+
+    return value
+
+
+def row_to_dict(row):
+    return {
+        key: json_safe(value)
+        for key, value in row.items()
+    }
+
+
+def rows_to_dict(rows):
+    return [row_to_dict(row) for row in rows]
+
+
+# ============================================================
+# SCHEMA
+# ============================================================
 
 def schema(con):
+    """
+    Descobre tabelas, colunas, PKs e FKs diretamente
+    do banco MySQL.
+    """
+
     out = {}
-    for (t,) in con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
-        fks = {r["from"]: {"table": r["table"], "col": r["to"]} for r in con.execute(f"PRAGMA foreign_key_list({t})")}
-        cols = [{"name": r["name"], "type": r["type"].upper(), "notnull": bool(r["notnull"]), "pk": r["pk"],
-                 "fk": fks.get(r["name"])} for r in con.execute(f"PRAGMA table_info({t})")]
-        pk = [c["name"] for c in sorted((c for c in cols if c["pk"]), key=lambda c: c["pk"])]
-        auto = len(pk) == 1 and next(c for c in cols if c["name"] == pk[0])["type"] == "INTEGER"
-        out[t] = {"cols": cols, "pk": pk, "auto": auto}
+
+    cur = con.cursor(dictionary=True)
+
+    # --------------------------------------------------------
+    # TABELAS
+    # --------------------------------------------------------
+
+    cur.execute("""
+        SELECT TABLE_NAME
+        FROM information_schema.tables
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_TYPE = 'BASE TABLE'
+        ORDER BY TABLE_NAME
+    """)
+
+    tables = [
+        row["TABLE_NAME"]
+        for row in cur.fetchall()
+    ]
+
+    for table in tables:
+
+        # ----------------------------------------------------
+        # COLUNAS
+        # ----------------------------------------------------
+
+        cur.execute("""
+            SELECT
+                COLUMN_NAME,
+                DATA_TYPE,
+                IS_NULLABLE,
+                COLUMN_KEY,
+                EXTRA
+            FROM information_schema.columns
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = %s
+            ORDER BY ORDINAL_POSITION
+        """, (table,))
+
+        columns = cur.fetchall()
+
+        # ----------------------------------------------------
+        # FOREIGN KEYS
+        # ----------------------------------------------------
+
+        cur.execute("""
+            SELECT
+                COLUMN_NAME,
+                REFERENCED_TABLE_NAME,
+                REFERENCED_COLUMN_NAME
+            FROM information_schema.KEY_COLUMN_USAGE
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = %s
+              AND REFERENCED_TABLE_NAME IS NOT NULL
+        """, (table,))
+
+        fk_rows = cur.fetchall()
+
+        fks = {
+            row["COLUMN_NAME"]: {
+                "table": row["REFERENCED_TABLE_NAME"],
+                "col": row["REFERENCED_COLUMN_NAME"]
+            }
+            for row in fk_rows
+        }
+
+        cols = []
+
+        for column in columns:
+
+            cols.append({
+                "name": column["COLUMN_NAME"],
+                "type": column["DATA_TYPE"].upper(),
+                "notnull": column["IS_NULLABLE"] == "NO",
+                "pk": 1 if column["COLUMN_KEY"] == "PRI" else 0,
+                "fk": fks.get(column["COLUMN_NAME"]),
+                "extra": column["EXTRA"]
+            })
+
+        pk = [
+            column["name"]
+            for column in cols
+            if column["pk"]
+        ]
+
+        auto = (
+            len(pk) == 1
+            and any(
+                column["name"] == pk[0]
+                and "auto_increment" in column["extra"].lower()
+                for column in cols
+            )
+        )
+
+        out[table] = {
+            "cols": cols,
+            "pk": pk,
+            "auto": auto
+        }
+
+    cur.close()
+
     return out
 
-def label_expr(sc, t, a):
-    if t in LABELS: return LABELS[t].format(a=a)
-    c = next((c["name"] for c in sc[t]["cols"] if c["name"].startswith("nome_")), sc[t]["pk"][0])
-    return f"{a}.{c}"
+
+# ============================================================
+# EXPRESSÃO DE LABEL
+# ============================================================
+
+def label_expr(sc, table, alias):
+    """
+    Define como um registro será apresentado quando
+    uma FK precisar ser exibida na interface.
+    """
+
+    if table in LABELS:
+        return LABELS[table].format(a=alias)
+
+    name_column = next(
+        (
+            column["name"]
+            for column in sc[table]["cols"]
+            if column["name"].startswith("nome_")
+        ),
+        sc[table]["pk"][0]
+    )
+
+    return f"{alias}.{name_column}"
+
+
+# ============================================================
+# RELATÓRIOS
+# ============================================================
 
 def reports():
-    txt = open(os.path.join(ROOT, "db/consultas.sql"), encoding="utf-8").read()
-    pat = re.compile(r"/\*\s*-{3,}\s*\n\s*(\d)\.(\d) — ([\s\S]*?)-{3,}\s*\*/\s*([\s\S]*?;)")
-    res = []
-    for m in pat.finditer(txt):
-        if m.group(1) not in "13": continue
-        title = re.sub(r"\s+", " ", m.group(3)).strip()
-        res.append({"id": f"{m.group(1)}.{m.group(2)}", "title": title,
-                    "group": "Subconsultas e joins" if m.group(1) == "1" else "Subconsultas com functions", "sql": m.group(4)})
-    return res
+    path = os.path.join(ROOT, "db", "consultas.sql")
 
-def friendly(e):
-    m = str(e)
-    if "FOREIGN KEY" in m: return "Este registro está vinculado a outros e não pode ser alterado ou excluído."
-    if "UNIQUE" in m: return "Já existe um registro com este valor: " + m.split(": ")[-1].split(".")[-1].replace("_", " ")
-    if "NOT NULL" in m: return "Preencha o campo obrigatório: " + m.split(".")[-1].replace("_", " ")
-    return m
+    if not os.path.exists(path):
+        return []
+
+    txt = open(
+        path,
+        encoding="utf-8"
+    ).read()
+
+    pattern = re.compile(
+        r"/\*\s*-{3,}\s*\n"
+        r"\s*(\d)\.(\d)\s+—\s+([\s\S]*?)"
+        r"-{3,}\s*\*/\s*([\s\S]*?;)"
+    )
+
+    result = []
+
+    for match in pattern.finditer(txt):
+
+        if match.group(1) not in "13":
+            continue
+
+        title = re.sub(
+            r"\s+",
+            " ",
+            match.group(3)
+        ).strip()
+
+        result.append({
+            "id": f"{match.group(1)}.{match.group(2)}",
+            "title": title,
+            "group": (
+                "Subconsultas e joins"
+                if match.group(1) == "1"
+                else "Subconsultas com functions"
+            ),
+            "sql": match.group(4)
+        })
+
+    return result
+
+
+# ============================================================
+# ERROS
+# ============================================================
+
+def friendly(error):
+
+    message = str(error)
+
+    if "FOREIGN KEY" in message:
+        return (
+            "Este registro está vinculado a outros "
+            "e não pode ser alterado ou excluído."
+        )
+
+    if "Duplicate entry" in message:
+        return (
+            "Já existe um registro com este valor."
+        )
+
+    if "cannot be null" in message.lower():
+        return (
+            "Preencha todos os campos obrigatórios."
+        )
+
+    if "Data truncated" in message:
+        return (
+            "O valor informado possui formato inválido."
+        )
+
+    return message
+
+
+# ============================================================
+# CONVERSÃO DE PARÂMETROS
+# ============================================================
+
+def convert_sql_params(sql):
+    """
+    Converte placeholders no formato SQLite (?) para
+    placeholders aceitos pelo MySQL (%s).
+    """
+
+    return sql.replace("?", "%s")
+
+
+# ============================================================
+# HANDLER HTTP
+# ============================================================
 
 class H(BaseHTTPRequestHandler):
-    def log_message(self, *a): pass
+
+    def log_message(self, *args):
+        pass
+
+    # --------------------------------------------------------
+    # RESPOSTA
+    # --------------------------------------------------------
+
     def send(self, code, obj, ctype="application/json"):
-        body = obj if isinstance(obj, bytes) else json.dumps(obj, ensure_ascii=False).encode()
-        self.send_response(code); self.send_header("Content-Type", ctype + "; charset=utf-8")
-        self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+
+        if isinstance(obj, bytes):
+            body = obj
+        else:
+            body = json.dumps(
+                obj,
+                ensure_ascii=False
+            ).encode("utf-8")
+
+        self.send_response(code)
+
+        self.send_header(
+            "Content-Type",
+            ctype + "; charset=utf-8"
+        )
+
+        self.send_header(
+            "Content-Length",
+            str(len(body))
+        )
+
+        self.end_headers()
+
+        self.wfile.write(body)
+
+    # --------------------------------------------------------
+    # ROTEAMENTO
+    # --------------------------------------------------------
+
     def route(self, method):
-        u = urlparse(self.path); parts = [unquote(p) for p in u.path.strip("/").split("/")]; qs = parse_qs(u.query)
-        if method == "GET" and parts[0] != "api":
-            return self.send(200, open(os.path.join(ROOT, "static/index.html"), "rb").read(), "text/html")
-        con = connect(); sc = schema(con)
+
+        parsed = urlparse(self.path)
+
+        parts = [
+            unquote(part)
+            for part in parsed.path.strip("/").split("/")
+        ]
+
+        qs = parse_qs(parsed.query)
+
+        # ----------------------------------------------------
+        # INTERFACE WEB
+        # ----------------------------------------------------
+
+        if method == "GET" and (
+            len(parts) == 0
+            or parts[0] != "api"
+        ):
+
+            static_dir = os.path.join(ROOT, "static")
+
+            # Procura automaticamente o arquivo HTML dentro
+            # da pasta static.
+            html_files = []
+
+            if os.path.isdir(static_dir):
+
+                for name in os.listdir(static_dir):
+
+                    path = os.path.join(
+                        static_dir,
+                        name
+                    )
+
+                    if (
+                        os.path.isfile(path)
+                        and name.lower().endswith(".html")
+                    ):
+                        html_files.append(path)
+
+            if html_files:
+
+                index = sorted(html_files)[0]
+
+                with open(index, "rb") as f:
+
+                    return self.send(
+                        200,
+                        f.read(),
+                        "text/html"
+                    )
+
+            return self.send(
+                404,
+                {
+                    "error": "Nenhum arquivo HTML encontrado em /static",
+                    "procurado_em": static_dir
+                }
+            )
+
+        con = None
+
         try:
-            if parts[1] == "schema": return self.send(200, sc)
-            if parts[1] == "reports":
+
+            con = connect()
+
+            sc = schema(con)
+
+            # ------------------------------------------------
+            # SCHEMA
+            # ------------------------------------------------
+
+            if len(parts) > 1 and parts[1] == "schema":
+
+                return self.send(
+                    200,
+                    sc
+                )
+
+            # ------------------------------------------------
+            # RELATÓRIOS
+            # ------------------------------------------------
+
+            if len(parts) > 1 and parts[1] == "reports":
+
                 rs = reports()
-                if len(parts) == 2: return self.send(200, [{k: r[k] for k in ("id", "title", "group")} for r in rs])
-                r = next(r for r in rs if r["id"] == parts[2])
-                cur = con.execute(r["sql"])
-                return self.send(200, {"columns": [d[0] for d in cur.description], "rows": [list(x) for x in cur.fetchall()]})
-            t = parts[2]
-            if t not in sc: return self.send(404, {"error": "Tabela não encontrada"})
-            s = sc[t]
+
+                if len(parts) == 2:
+
+                    return self.send(
+                        200,
+                        [
+                            {
+                                key: report[key]
+                                for key in (
+                                    "id",
+                                    "title",
+                                    "group"
+                                )
+                            }
+                            for report in rs
+                        ]
+                    )
+
+                report = next(
+                    (
+                        report
+                        for report in rs
+                        if report["id"] == parts[2]
+                    ),
+                    None
+                )
+
+                if not report:
+
+                    return self.send(
+                        404,
+                        {
+                            "error": "Relatório não encontrado"
+                        }
+                    )
+
+                cur = con.cursor()
+
+                sql = convert_sql_params(
+                    report["sql"]
+                )
+
+                cur.execute(sql)
+
+                rows = cur.fetchall()
+
+                columns = [
+                    description[0]
+                    for description in cur.description
+                ]
+
+                rows = [
+                    [
+                        json_safe(value)
+                        for value in row
+                    ]
+                    for row in rows
+                ]
+
+                cur.close()
+
+                return self.send(
+                    200,
+                    {
+                        "columns": columns,
+                        "rows": rows
+                    }
+                )
+
+            # ------------------------------------------------
+            # TABELA
+            # ------------------------------------------------
+
+            if len(parts) < 3:
+
+                return self.send(
+                    404,
+                    {
+                        "error": "Rota inválida"
+                    }
+                )
+
+            table = parts[2]
+
+            if table not in sc:
+
+                return self.send(
+                    404,
+                    {
+                        "error": "Tabela não encontrada"
+                    }
+                )
+
+            table_schema = sc[table]
+
+            # ------------------------------------------------
+            # OPTIONS
+            # ------------------------------------------------
+
             if parts[1] == "options":
-                rows = con.execute(f"SELECT {s['pk'][0]} AS id, {label_expr(sc, t, 't')} AS label FROM {t} t ORDER BY label").fetchall()
-                return self.send(200, [dict(r) for r in rows])
-            pk = json.loads(qs["pk"][0]) if "pk" in qs else None
-            where = " AND ".join(f"{c}=?" for c in s["pk"]); pkv = [pk[c] for c in s["pk"]] if pk else []
+
+                pk = table_schema["pk"][0]
+
+                label = label_expr(
+                    sc,
+                    table,
+                    "t"
+                )
+
+                sql = (
+                    f"SELECT {pk} AS id, "
+                    f"{label} AS label "
+                    f"FROM {table} t "
+                    f"ORDER BY label"
+                )
+
+                cur = con.cursor(
+                    dictionary=True
+                )
+
+                cur.execute(sql)
+
+                rows = rows_to_dict(
+                    cur.fetchall()
+                )
+
+                cur.close()
+
+                return self.send(
+                    200,
+                    rows
+                )
+
+            # ------------------------------------------------
+            # CHAVE PRIMÁRIA
+            # ------------------------------------------------
+
+            pk = None
+
+            if "pk" in qs:
+
+                pk = json.loads(
+                    qs["pk"][0]
+                )
+
+            pk_columns = table_schema["pk"]
+
+            where = " AND ".join(
+                f"{column}=%s"
+                for column in pk_columns
+            )
+
+            pk_values = (
+                [
+                    pk[column]
+                    for column in pk_columns
+                ]
+                if pk
+                else []
+            )
+
+            # ------------------------------------------------
+            # GET
+            # ------------------------------------------------
+
             if method == "GET":
-                extra = "".join(f", (SELECT {label_expr(sc, c['fk']['table'], 'r')} FROM {c['fk']['table']} r WHERE r.{c['fk']['col']}=t.{c['name']}) AS {c['name']}__label"
-                                for c in s["cols"] if c["fk"])
-                sql = f"SELECT * FROM (SELECT t.*{extra} FROM {t} t)"; args = []
+
+                extra = []
+
+                for column in table_schema["cols"]:
+
+                    if column["fk"]:
+
+                        fk_table = column["fk"]["table"]
+                        fk_col = column["fk"]["col"]
+                        column_name = column["name"]
+
+                        expression = label_expr(
+                            sc,
+                            fk_table,
+                            "r"
+                        )
+
+                        extra.append(
+                            f"""
+                            (
+                                SELECT {expression}
+                                FROM {fk_table} r
+                                WHERE r.{fk_col} = t.{column_name}
+                            ) AS {column_name}__label
+                            """
+                        )
+
+                extra_sql = ""
+
+                if extra:
+                    extra_sql = "," + ",".join(extra)
+
+                sql = (
+                    f"SELECT t.*{extra_sql} "
+                    f"FROM {table} t"
+                )
+
+                args = []
+
+                # --------------------------------------------
+                # PESQUISA
+                # --------------------------------------------
+
                 if qs.get("q"):
-                    cols = [c["name"] for c in s["cols"] if not c["pk"] and c["type"][:3] in ("VAR", "CHA") or c["name"].endswith("__label")]
-                    cols += [c["name"] + "__label" for c in s["cols"] if c["fk"]]
-                    sql += " WHERE " + " OR ".join(f"IFNULL({c},'') LIKE ?" for c in dict.fromkeys(cols)); args = [f"%{qs['q'][0]}%"] * len(set(cols))
-                order = ", ".join(s["pk"])
-                return self.send(200, [dict(r) for r in con.execute(sql + f" ORDER BY {order} DESC" if s["auto"] else sql + f" ORDER BY {order}", args)])
-            data = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}") if method != "DELETE" else {}
-            names = [c["name"] for c in s["cols"] if c["name"] in data and not (s["auto"] and c["name"] in s["pk"])]
-            vals = [None if data[n] == "" else data[n] for n in names]
-            if method == "POST":
-                cur = con.execute(f"INSERT INTO {t} ({','.join(names)}) VALUES ({','.join('?' * len(names))})", vals)
-            elif method == "PUT":
-                con.execute(f"UPDATE {t} SET {','.join(n + '=?' for n in names)} WHERE {where}", vals + pkv)
+
+                    searchable = []
+
+                    for column in table_schema["cols"]:
+
+                        data_type = column["type"]
+
+                        if data_type in (
+                            "VARCHAR",
+                            "CHAR",
+                            "TEXT",
+                            "TINYTEXT",
+                            "MEDIUMTEXT",
+                            "LONGTEXT"
+                        ):
+
+                            searchable.append(
+                                column["name"]
+                            )
+
+                    for column in table_schema["cols"]:
+
+                        if column["fk"]:
+
+                            searchable.append(
+                                column["name"] + "__label"
+                            )
+
+                    searchable = list(
+                        dict.fromkeys(
+                            searchable
+                        )
+                    )
+
+                    if searchable:
+
+                        sql += " WHERE " + " OR ".join(
+                            f"IFNULL({column}, '') LIKE %s"
+                            for column in searchable
+                        )
+
+                        args = [
+                            f"%{qs['q'][0]}%"
+                            for _ in searchable
+                        ]
+
+                # --------------------------------------------
+                # ORDENAÇÃO
+                # --------------------------------------------
+
+                order = ", ".join(
+                    table_schema["pk"]
+                )
+
+                if table_schema["auto"]:
+
+                    sql += f" ORDER BY {order} DESC"
+
+                else:
+
+                    sql += f" ORDER BY {order}"
+
+                cur = con.cursor(
+                    dictionary=True
+                )
+
+                cur.execute(
+                    sql,
+                    args
+                )
+
+                rows = rows_to_dict(
+                    cur.fetchall()
+                )
+
+                cur.close()
+
+                return self.send(
+                    200,
+                    rows
+                )
+
+            # ------------------------------------------------
+            # RECEBER DADOS
+            # ------------------------------------------------
+
+            if method != "DELETE":
+
+                length = int(
+                    self.headers.get(
+                        "Content-Length",
+                        0
+                    )
+                )
+
+                raw = self.rfile.read(
+                    length
+                )
+
+                data = (
+                    json.loads(raw)
+                    if raw
+                    else {}
+                )
+
             else:
-                con.execute(f"DELETE FROM {t} WHERE {where}", pkv)
-            con.commit(); self.send(200, {"ok": True})
-        except sqlite3.Error as e:
-            con.rollback(); self.send(400, {"error": friendly(e)})
+
+                data = {}
+
+            # ------------------------------------------------
+            # CAMPOS
+            # ------------------------------------------------
+
+            names = []
+
+            for column in table_schema["cols"]:
+
+                name = column["name"]
+
+                if name not in data:
+                    continue
+
+                # Não permite que a aplicação altere
+                # uma PK AUTO_INCREMENT.
+                if (
+                    table_schema["auto"]
+                    and name in table_schema["pk"]
+                ):
+                    continue
+
+                names.append(name)
+
+            values = [
+                None if data[name] == ""
+                else data[name]
+                for name in names
+            ]
+
+            cur = con.cursor()
+
+            # ------------------------------------------------
+            # INSERT
+            # ------------------------------------------------
+
+            if method == "POST":
+
+                if not names:
+
+                    return self.send(
+                        400,
+                        {
+                            "error": "Nenhum campo informado."
+                        }
+                    )
+
+                placeholders = ", ".join(
+                    ["%s"] * len(names)
+                )
+
+                sql = (
+                    f"INSERT INTO {table} "
+                    f"({','.join(names)}) "
+                    f"VALUES ({placeholders})"
+                )
+
+                cur.execute(
+                    sql,
+                    values
+                )
+
+            # ------------------------------------------------
+            # UPDATE
+            # ------------------------------------------------
+
+            elif method == "PUT":
+
+                if not pk:
+
+                    return self.send(
+                        400,
+                        {
+                            "error": "Chave primária não informada."
+                        }
+                    )
+
+                if not names:
+
+                    return self.send(
+                        400,
+                        {
+                            "error": "Nenhum campo para atualizar."
+                        }
+                    )
+
+                assignments = ", ".join(
+                    f"{name}=%s"
+                    for name in names
+                )
+
+                sql = (
+                    f"UPDATE {table} "
+                    f"SET {assignments} "
+                    f"WHERE {where}"
+                )
+
+                cur.execute(
+                    sql,
+                    values + pk_values
+                )
+
+            # ------------------------------------------------
+            # DELETE
+            # ------------------------------------------------
+
+            elif method == "DELETE":
+
+                if not pk:
+
+                    return self.send(
+                        400,
+                        {
+                            "error": "Chave primária não informada."
+                        }
+                    )
+
+                sql = (
+                    f"DELETE FROM {table} "
+                    f"WHERE {where}"
+                )
+
+                cur.execute(
+                    sql,
+                    pk_values
+                )
+
+            else:
+
+                return self.send(
+                    405,
+                    {
+                        "error": "Método não suportado."
+                    }
+                )
+
+            # ------------------------------------------------
+            # COMMIT
+            # ------------------------------------------------
+
+            con.commit()
+
+            return self.send(
+                200,
+                {
+                    "ok": True
+                }
+            )
+
+        except mysql.connector.Error as error:
+
+            if con:
+                con.rollback()
+
+            return self.send(
+                400,
+                {
+                    "error": friendly(error)
+                }
+            )
+
         except (StopIteration, IndexError, KeyError):
-            self.send(404, {"error": "Não encontrado"})
+
+            return self.send(
+                404,
+                {
+                    "error": "Não encontrado"
+                }
+            )
+
+        except Exception as error:
+
+            if con:
+                con.rollback()
+
+            return self.send(
+                500,
+                {
+                    "error": str(error)
+                }
+            )
+
         finally:
-            con.close()
-    do_GET = lambda s: s.route("GET"); do_POST = lambda s: s.route("POST")
-    do_PUT = lambda s: s.route("PUT"); do_DELETE = lambda s: s.route("DELETE")
+
+            if con:
+                con.close()
+
+    # --------------------------------------------------------
+    # HTTP
+    # --------------------------------------------------------
+
+    def do_GET(self):
+        self.route("GET")
+
+    def do_POST(self):
+        self.route("POST")
+
+    def do_PUT(self):
+        self.route("PUT")
+
+    def do_DELETE(self):
+        self.route("DELETE")
+
+
+# ============================================================
+# INICIALIZAÇÃO
+# ============================================================
 
 if __name__ == "__main__":
-    if "--reset" in sys.argv and os.path.exists(DB): os.remove(DB)
-    if not os.path.exists(DB): build_db(); print("Banco criado a partir de db/*.sql")
-    apply_triggers(); print("Triggers aplicadas (db/triggers.sql)")
-    port = int(os.environ.get("PORT", 8000))
-    print(f"RH rodando em http://localhost:{port}")
-    ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            8000
+        )
+    )
+
+    # Testa a conexão antes de iniciar o servidor.
+    try:
+
+        con = connect()
+
+        cur = con.cursor()
+
+        cur.execute(
+            "SELECT DATABASE()"
+        )
+
+        database = cur.fetchone()[0]
+
+        cur.close()
+        con.close()
+
+        print(
+            f"Conectado ao MySQL: {database}"
+        )
+
+    except mysql.connector.Error as error:
+
+        print(
+            "ERRO AO CONECTAR AO MYSQL:"
+        )
+
+        print(
+            error
+        )
+
+        sys.exit(1)
+
+    print(
+        f"RH rodando em http://localhost:{port}"
+    )
+
+    ThreadingHTTPServer(
+        ("0.0.0.0", port),
+        H
+    ).serve_forever()
